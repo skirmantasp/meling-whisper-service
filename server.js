@@ -31,7 +31,15 @@ for (const dir of [UPLOAD_DIR, OUTPUT_DIR]) {
 const ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.mp4', '.m4a', '.ogg', '.webm', '.flac'];
 const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
 
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://meling-portal-production.up.railway.app',
+    'http://localhost:5173',
+    'http://localhost:3000'
+  ],
+  methods: ['GET', 'POST'],
+  allowedHeaders: ['Content-Type']
+}));
 app.use(express.json({ limit: '50mb' }));
 
 // ---------------------------------------------------------------------------
