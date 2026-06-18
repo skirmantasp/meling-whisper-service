@@ -40,6 +40,10 @@ app.use(cors({
   methods: ['GET', 'POST'],
   allowedHeaders: ['Content-Type']
 }));
+app.use((req, res, next) => {
+  res.setTimeout(600000); // 10 minutes
+  next();
+});
 app.use(express.json({ limit: '50mb' }));
 
 // ---------------------------------------------------------------------------
@@ -269,8 +273,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
-app.listen(PORT, () => {
-  console.log(`meling-whisper-service listening on port ${PORT}`);
-  console.log(`Model: ${WHISPER_MODEL} | Default language: ${DEFAULT_LANGUAGE}`);
-  console.log(`Host: ${os.hostname()}`);
+const server = app.listen(PORT, () => {
+  console.log(`✅ Meling Whisper Service running on port ${PORT}`);
+  console.log(`   Model: ${process.env.WHISPER_MODEL || 'medium'}`);
+  console.log(`   GDPR: EU-only processing`);
 });
+server.timeout = 600000; // 10 minutes
