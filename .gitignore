@@ -1,5 +1,6 @@
 node_modules/
 .env
+.claude/
 /tmp/
 *.pyc
 __pycache__/
