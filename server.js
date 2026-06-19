@@ -149,7 +149,7 @@ app.post('/transcribe', (req, res) => {
     const model = WHISPER_MODEL;
 
     const command =
-      `whisper ${shellQuote(inputPath)} ` +
+      `python3 -m whisper ${shellQuote(inputPath)} ` +
       `--model ${model} ` +
       `--language ${language} ` +
       `--output_format json ` +
@@ -159,6 +159,9 @@ app.post('/transcribe', (req, res) => {
     console.log(`[transcribe] Running: ${command}`);
 
     exec(command, { maxBuffer: 1024 * 1024 * 64 }, (execErr, stdout, stderr) => {
+      console.log('[Whisper] stdout:', stdout?.substring(0, 500));
+      console.log('[Whisper] stderr:', stderr?.substring(0, 500));
+
       // Input audio is no longer needed regardless of outcome.
       safeUnlink(inputPath);
 
