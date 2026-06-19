@@ -7,6 +7,7 @@ const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
 
 const app = express();
 
@@ -30,6 +31,11 @@ for (const dir of [UPLOAD_DIR, OUTPUT_DIR]) {
 
 const ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.mp4', '.m4a', '.ogg', '.webm', '.flac'];
 const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+
+// In-memory registry of async transcription jobs. Each entry:
+//   { status: 'processing' | 'done' | 'error', result, error, created_at }
+const jobs = new Map();
+const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
 
 app.use(cors({
   origin: [
@@ -95,20 +101,6 @@ function safeUnlink(filePath) {
   });
 }
 
-/** Find the most recently modified JSON file in a directory. */
-function findLatestJson(dir) {
-  const files = fs
-    .readdirSync(dir)
-    .filter((f) => f.toLowerCase().endsWith('.json'))
-    .map((f) => {
-      const full = path.join(dir, f);
-      return { full, mtime: fs.statSync(full).mtimeMs };
-    })
-    .sort((a, b) => b.mtime - a.mtime);
-
-  return files.length > 0 ? files[0].full : null;
-}
-
 /** Shell-escape a path for safe use inside a double-quoted argument. */
 function shellQuote(value) {
   // Wrap in double quotes and escape any embedded double quotes / backslashes.
@@ -130,7 +122,94 @@ app.get('/health', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// POST /transcribe
+// Background transcription runner
+// ---------------------------------------------------------------------------
+
+/**
+ * Run Whisper for a single job in the background, updating the job entry in
+ * `jobs` when it completes or fails. Never throws; all outcomes are recorded
+ * on the job. The input audio and output JSON are deleted once Whisper is done.
+ */
+function runWhisperJob({ jobId, inputPath, originalFilename, language, model }) {
+  const command =
+    `python3 -m whisper ${shellQuote(inputPath)} ` +
+    `--model ${model} ` +
+    `--language ${language} ` +
+    `--output_format json ` +
+    `--output_dir ${shellQuote(OUTPUT_DIR)} ` +
+    `--verbose False`;
+
+  console.log(`[transcribe:${jobId}] Running: ${command}`);
+
+  exec(command, { maxBuffer: 1024 * 1024 * 64 }, (execErr, stdout, stderr) => {
+    console.log(`[Whisper:${jobId}] stdout:`, stdout?.substring(0, 500));
+    console.log(`[Whisper:${jobId}] stderr:`, stderr?.substring(0, 500));
+
+    // Input audio is no longer needed once Whisper has finished reading it.
+    safeUnlink(inputPath);
+
+    const job = jobs.get(jobId);
+    if (!job) return; // Job already expired and was cleaned up.
+
+    if (execErr) {
+      console.error(`[transcribe:${jobId}] Whisper failed:`, stderr || execErr.message);
+      job.status = 'error';
+      job.error = (stderr || execErr.message || 'Transcription failed.').trim();
+      return;
+    }
+
+    // Whisper writes "<input-basename>.json" into OUTPUT_DIR. Deriving the path
+    // deterministically (rather than picking the newest file) keeps concurrent
+    // jobs from grabbing each other's output.
+    const jsonPath = path.join(
+      OUTPUT_DIR,
+      `${path.basename(inputPath, path.extname(inputPath))}.json`
+    );
+
+    let whisperResult;
+    try {
+      whisperResult = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
+    } catch (parseErr) {
+      safeUnlink(jsonPath);
+      job.status = 'error';
+      job.error = `Failed to parse Whisper output: ${parseErr.message}`;
+      return;
+    }
+
+    // Output JSON is no longer needed once read.
+    safeUnlink(jsonPath);
+
+    const rawSegments = Array.isArray(whisperResult.segments) ? whisperResult.segments : [];
+    const segments = rawSegments.map((seg, index) => ({
+      id: typeof seg.id === 'number' ? seg.id : index,
+      start: toTimestamp(seg.start),
+      end: toTimestamp(seg.end),
+      start_seconds: Number(seg.start) || 0,
+      end_seconds: Number(seg.end) || 0,
+      text: (seg.text || '').trim(),
+    }));
+
+    const durationSeconds =
+      segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
+
+    job.status = 'done';
+    job.result = {
+      text: (whisperResult.text || '').trim(),
+      language: whisperResult.language || language,
+      duration_seconds: durationSeconds,
+      segments,
+      metadata: {
+        original_filename: originalFilename,
+        model_used: model,
+        processed_at: new Date().toISOString(),
+        gdpr_note: GDPR_NOTE,
+      },
+    };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// POST /transcribe  — accepts an upload, starts a background job, returns its ID
 // ---------------------------------------------------------------------------
 app.post('/transcribe', (req, res) => {
   upload.single('audio')(req, res, (uploadErr) => {
@@ -148,77 +227,36 @@ app.post('/transcribe', (req, res) => {
     const language = (req.body && req.body.language) || DEFAULT_LANGUAGE;
     const model = WHISPER_MODEL;
 
-    const command =
-      `python3 -m whisper ${shellQuote(inputPath)} ` +
-      `--model ${model} ` +
-      `--language ${language} ` +
-      `--output_format json ` +
-      `--output_dir ${shellQuote(OUTPUT_DIR)} ` +
-      `--verbose False`;
+    const jobId = crypto.randomUUID();
+    jobs.set(jobId, { status: 'processing', result: null, error: null, created_at: Date.now() });
 
-    console.log(`[transcribe] Running: ${command}`);
+    // Drop the job entry after one hour so the Map does not grow unbounded.
+    setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 
-    exec(command, { maxBuffer: 1024 * 1024 * 64 }, (execErr, stdout, stderr) => {
-      console.log('[Whisper] stdout:', stdout?.substring(0, 500));
-      console.log('[Whisper] stderr:', stderr?.substring(0, 500));
+    // Kick off Whisper in the background — do NOT await it.
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model });
 
-      // Input audio is no longer needed regardless of outcome.
-      safeUnlink(inputPath);
-
-      if (execErr) {
-        console.error('[transcribe] Whisper failed:', stderr || execErr.message);
-        return res.status(500).json({
-          error: 'Transcription failed.',
-          details: (stderr || execErr.message || '').trim(),
-        });
-      }
-
-      const jsonPath = findLatestJson(OUTPUT_DIR);
-      if (!jsonPath) {
-        return res.status(500).json({ error: 'Whisper produced no JSON output.' });
-      }
-
-      let whisperResult;
-      try {
-        whisperResult = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-      } catch (parseErr) {
-        safeUnlink(jsonPath);
-        return res.status(500).json({
-          error: 'Failed to parse Whisper output.',
-          details: parseErr.message,
-        });
-      }
-
-      // Output JSON is no longer needed once read.
-      safeUnlink(jsonPath);
-
-      const rawSegments = Array.isArray(whisperResult.segments) ? whisperResult.segments : [];
-      const segments = rawSegments.map((seg, index) => ({
-        id: typeof seg.id === 'number' ? seg.id : index,
-        start: toTimestamp(seg.start),
-        end: toTimestamp(seg.end),
-        start_seconds: Number(seg.start) || 0,
-        end_seconds: Number(seg.end) || 0,
-        text: (seg.text || '').trim(),
-      }));
-
-      const durationSeconds =
-        segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
-
-      res.json({
-        text: (whisperResult.text || '').trim(),
-        language: whisperResult.language || language,
-        duration_seconds: durationSeconds,
-        segments,
-        metadata: {
-          original_filename: originalFilename,
-          model_used: model,
-          processed_at: new Date().toISOString(),
-          gdpr_note: GDPR_NOTE,
-        },
-      });
-    });
+    res.json({ job_id: jobId, status: 'processing' });
   });
+});
+
+// ---------------------------------------------------------------------------
+// GET /status/:job_id  — poll the status/result of a transcription job
+// ---------------------------------------------------------------------------
+app.get('/status/:job_id', (req, res) => {
+  const job = jobs.get(req.params.job_id);
+
+  if (!job) {
+    return res.status(404).json({ status: 'error', error: 'Unknown or expired job ID.' });
+  }
+
+  if (job.status === 'done') {
+    return res.json({ status: 'done', result: job.result });
+  }
+  if (job.status === 'error') {
+    return res.json({ status: 'error', error: job.error });
+  }
+  return res.json({ status: 'processing' });
 });
 
 // ---------------------------------------------------------------------------
