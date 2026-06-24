@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y \
 
 # CPU build of PyTorch keeps the image small; transformers drives NB-Whisper.
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
-RUN pip install --no-cache-dir transformers accelerate
+RUN pip install --no-cache-dir transformers accelerate soundfile librosa
 
 # Pre-download the NB-Whisper Norwegian model so the first request is fast.
 ARG WHISPER_MODEL=NbAiLab/nb-whisper-medium
