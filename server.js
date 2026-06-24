@@ -12,12 +12,12 @@ const crypto = require('crypto');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'medium';
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'NbAiLab/nb-whisper-medium';
 const DEFAULT_LANGUAGE = 'no';
 const GDPR_NOTE =
   'All audio is processed in-memory on EU infrastructure (Railway EU-West, Amsterdam) ' +
-  'using the open-source Whisper model. No audio or transcript leaves the EU, and all ' +
-  'temporary files are deleted immediately after processing.';
+  'using the open-source NB-Whisper Norwegian model. No audio or transcript leaves the EU, ' +
+  'and all temporary files are deleted immediately after processing.';
 
 const UPLOAD_DIR = '/tmp/whisper-uploads/';
 const OUTPUT_DIR = '/tmp/whisper-output/';
@@ -107,6 +107,88 @@ function shellQuote(value) {
   return `"${String(value).replace(/(["\\$`])/g, '\\$1')}"`;
 }
 
+/** Escape a string for safe interpolation into HTML email bodies. */
+function escapeHtml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+/** Format a processing duration (milliseconds) into a Norwegian-friendly string. */
+function formatProcessingTime(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return minutes > 0 ? `${minutes} min ${seconds} sek` : `${seconds} sek`;
+}
+
+/**
+ * Send a notification email through the Resend API. Fire-and-forget: never
+ * throws, logs failures. No-ops if Resend is not configured or no recipient
+ * was provided.
+ */
+async function sendResendEmail({ to, subject, html }) {
+  if (!to) return;
+
+  const apiKey = process.env.RESEND_API_KEY;
+  const from = process.env.RESEND_FROM_EMAIL;
+  if (!apiKey || !from) {
+    console.warn('[email] RESEND_API_KEY / RESEND_FROM_EMAIL not configured; skipping email.');
+    return;
+  }
+
+  try {
+    const resp = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ from, to, subject, html }),
+    });
+
+    if (!resp.ok) {
+      const body = await resp.text();
+      console.error(`[email] Resend returned ${resp.status}: ${body}`);
+    } else {
+      console.log(`[email] Notification sent to ${to} ("${subject}")`);
+    }
+  } catch (err) {
+    console.error('[email] Failed to send notification:', err.message);
+  }
+}
+
+/** Notify the requester that their transcription job finished successfully. */
+function notifyJobSuccess(email, jobId, result, processingMs) {
+  if (!email) return;
+
+  const preview = (result.text || '').slice(0, 300);
+  const html =
+    `<h2>Transkripsjon ferdig ✓</h2>` +
+    `<p><strong>Jobb-ID:</strong> ${escapeHtml(jobId)}</p>` +
+    `<p><strong>Behandlingstid:</strong> ${escapeHtml(formatProcessingTime(processingMs))}</p>` +
+    `<p><strong>Forhåndsvisning:</strong></p>` +
+    `<blockquote>${escapeHtml(preview)}${result.text.length > 300 ? '…' : ''}</blockquote>`;
+
+  sendResendEmail({ to: email, subject: 'Transkripsjon ferdig ✓', html });
+}
+
+/** Notify the requester that their transcription job failed. */
+function notifyJobError(email, jobId, errorMsg, processingMs) {
+  if (!email) return;
+
+  const html =
+    `<h2>Transkripsjon feilet</h2>` +
+    `<p><strong>Jobb-ID:</strong> ${escapeHtml(jobId)}</p>` +
+    `<p><strong>Behandlingstid:</strong> ${escapeHtml(formatProcessingTime(processingMs))}</p>` +
+    `<p><strong>Feilmelding:</strong></p>` +
+    `<blockquote>${escapeHtml(errorMsg)}</blockquote>`;
+
+  sendResendEmail({ to: email, subject: 'Transkripsjon feilet', html });
+}
+
 // ---------------------------------------------------------------------------
 // GET /health
 // ---------------------------------------------------------------------------
@@ -130,14 +212,21 @@ app.get('/health', (req, res) => {
  * `jobs` when it completes or fails. Never throws; all outcomes are recorded
  * on the job. The input audio and output JSON are deleted once Whisper is done.
  */
-function runWhisperJob({ jobId, inputPath, originalFilename, language, model }) {
+function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email }) {
+  // The NB-Whisper model is a HuggingFace transformers checkpoint, so it runs
+  // through a small Python helper (transcribe.py) rather than the whisper CLI.
+  // The helper writes JSON in the same shape the rest of this function expects.
+  const jsonPath = path.join(
+    OUTPUT_DIR,
+    `${path.basename(inputPath, path.extname(inputPath))}.json`
+  );
+
   const command =
-    `python3 -m whisper ${shellQuote(inputPath)} ` +
-    `--model ${model} ` +
-    `--language ${language} ` +
-    `--output_format json ` +
-    `--output_dir ${shellQuote(OUTPUT_DIR)} ` +
-    `--verbose False`;
+    `python3 ${shellQuote(path.join(__dirname, 'transcribe.py'))} ` +
+    `--input ${shellQuote(inputPath)} ` +
+    `--model ${shellQuote(model)} ` +
+    `--language ${shellQuote(language)} ` +
+    `--output ${shellQuote(jsonPath)}`;
 
   console.log(`[transcribe:${jobId}] Running: ${command}`);
 
@@ -145,26 +234,22 @@ function runWhisperJob({ jobId, inputPath, originalFilename, language, model }) 
     console.log(`[Whisper:${jobId}] stdout:`, stdout?.substring(0, 500));
     console.log(`[Whisper:${jobId}] stderr:`, stderr?.substring(0, 500));
 
-    // Input audio is no longer needed once Whisper has finished reading it.
+    // Input audio is no longer needed once the model has finished reading it.
     safeUnlink(inputPath);
 
     const job = jobs.get(jobId);
     if (!job) return; // Job already expired and was cleaned up.
 
+    const processingMs = Date.now() - job.created_at;
+
     if (execErr) {
       console.error(`[transcribe:${jobId}] Whisper failed:`, stderr || execErr.message);
+      safeUnlink(jsonPath);
       job.status = 'error';
       job.error = (stderr || execErr.message || 'Transcription failed.').trim();
+      notifyJobError(email, jobId, job.error, processingMs);
       return;
     }
-
-    // Whisper writes "<input-basename>.json" into OUTPUT_DIR. Deriving the path
-    // deterministically (rather than picking the newest file) keeps concurrent
-    // jobs from grabbing each other's output.
-    const jsonPath = path.join(
-      OUTPUT_DIR,
-      `${path.basename(inputPath, path.extname(inputPath))}.json`
-    );
 
     let whisperResult;
     try {
@@ -173,6 +258,7 @@ function runWhisperJob({ jobId, inputPath, originalFilename, language, model }) 
       safeUnlink(jsonPath);
       job.status = 'error';
       job.error = `Failed to parse Whisper output: ${parseErr.message}`;
+      notifyJobError(email, jobId, job.error, processingMs);
       return;
     }
 
@@ -205,6 +291,8 @@ function runWhisperJob({ jobId, inputPath, originalFilename, language, model }) 
         gdpr_note: GDPR_NOTE,
       },
     };
+
+    notifyJobSuccess(email, jobId, job.result, processingMs);
   });
 }
 
@@ -226,15 +314,16 @@ app.post('/transcribe', (req, res) => {
     const originalFilename = req.file.originalname;
     const language = (req.body && req.body.language) || DEFAULT_LANGUAGE;
     const model = WHISPER_MODEL;
+    const email = (req.body && typeof req.body.email === 'string' && req.body.email.trim()) || null;
 
     const jobId = crypto.randomUUID();
-    jobs.set(jobId, { status: 'processing', result: null, error: null, created_at: Date.now() });
+    jobs.set(jobId, { status: 'processing', result: null, error: null, created_at: Date.now(), email });
 
     // Drop the job entry after one hour so the Map does not grow unbounded.
     setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 
     // Kick off Whisper in the background — do NOT await it.
-    runWhisperJob({ jobId, inputPath, originalFilename, language, model });
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email });
 
     res.json({ job_id: jobId, status: 'processing' });
   });
