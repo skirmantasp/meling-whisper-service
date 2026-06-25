@@ -3,10 +3,9 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { exec } = require('child_process');
+const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const os = require('os');
 const crypto = require('crypto');
 
 const app = express();
@@ -99,12 +98,6 @@ function safeUnlink(filePath) {
       console.error(`Failed to delete ${filePath}:`, err.message);
     }
   });
-}
-
-/** Shell-escape a path for safe use inside a double-quoted argument. */
-function shellQuote(value) {
-  // Wrap in double quotes and escape any embedded double quotes / backslashes.
-  return `"${String(value).replace(/(["\\$`])/g, '\\$1')}"`;
 }
 
 /** Escape a string for safe interpolation into HTML email bodies. */
@@ -204,96 +197,116 @@ app.get('/health', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// Whisper server HTTP client
+// ---------------------------------------------------------------------------
+
+/**
+ * POST to the co-located Python faster-whisper server (127.0.0.1:8765).
+ * The server holds the model in memory between calls, so there is no
+ * per-request model load penalty.
+ */
+function callWhisperServer(inputPath, language) {
+  return new Promise((resolve, reject) => {
+    const body = JSON.stringify({ input: inputPath, language });
+    const options = {
+      hostname: '127.0.0.1',
+      port: 8765,
+      path: '/transcribe',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+      timeout: 600000,
+    };
+
+    const req = http.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`Whisper server returned ${res.statusCode}: ${data}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(data));
+        } catch (e) {
+          reject(new Error(`Failed to parse Whisper response: ${e.message}`));
+        }
+      });
+    });
+
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('Whisper transcription timed out after 10 minutes')));
+    req.write(body);
+    req.end();
+  });
+}
+
+// ---------------------------------------------------------------------------
 // Background transcription runner
 // ---------------------------------------------------------------------------
 
 /**
- * Run Whisper for a single job in the background, updating the job entry in
- * `jobs` when it completes or fails. Never throws; all outcomes are recorded
- * on the job. The input audio and output JSON are deleted once Whisper is done.
+ * Submit a transcription job to the persistent Python Whisper server, then
+ * update the job entry in `jobs` when it completes or fails. Never throws;
+ * all outcomes are recorded on the job.
  */
-function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email }) {
-  // The NB-Whisper model is a HuggingFace transformers checkpoint, so it runs
-  // through a small Python helper (transcribe.py) rather than the whisper CLI.
-  // The helper writes JSON in the same shape the rest of this function expects.
-  const jsonPath = path.join(
-    OUTPUT_DIR,
-    `${path.basename(inputPath, path.extname(inputPath))}.json`
-  );
+async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email }) {
+  const job = jobs.get(jobId);
+  if (!job) return;
 
-  const command =
-    `python3 ${shellQuote(path.join(__dirname, 'transcribe.py'))} ` +
-    `--input ${shellQuote(inputPath)} ` +
-    `--model ${shellQuote(model)} ` +
-    `--language ${shellQuote(language)} ` +
-    `--output ${shellQuote(jsonPath)}`;
+  console.log(`[transcribe:${jobId}] Sending to whisper server: ${inputPath}`);
 
-  console.log(`[transcribe:${jobId}] Running: ${command}`);
-
-  exec(command, { maxBuffer: 1024 * 1024 * 64 }, (execErr, stdout, stderr) => {
-    console.log(`[Whisper:${jobId}] stdout:`, stdout?.substring(0, 500));
-    console.log(`[Whisper:${jobId}] stderr:`, stderr?.substring(0, 500));
-
-    // Input audio is no longer needed once the model has finished reading it.
+  let whisperResult;
+  try {
+    whisperResult = await callWhisperServer(inputPath, language);
+  } catch (err) {
     safeUnlink(inputPath);
+    const currentJob = jobs.get(jobId);
+    if (!currentJob) return;
+    const processingMs = Date.now() - currentJob.created_at;
+    console.error(`[transcribe:${jobId}] Whisper failed:`, err.message);
+    currentJob.status = 'error';
+    currentJob.error = err.message || 'Transcription failed.';
+    notifyJobError(email, jobId, currentJob.error, processingMs);
+    return;
+  }
 
-    const job = jobs.get(jobId);
-    if (!job) return; // Job already expired and was cleaned up.
+  safeUnlink(inputPath);
 
-    const processingMs = Date.now() - job.created_at;
+  const currentJob = jobs.get(jobId);
+  if (!currentJob) return;
+  const processingMs = Date.now() - currentJob.created_at;
 
-    if (execErr) {
-      console.error(`[transcribe:${jobId}] Whisper failed:`, stderr || execErr.message);
-      safeUnlink(jsonPath);
-      job.status = 'error';
-      job.error = (stderr || execErr.message || 'Transcription failed.').trim();
-      notifyJobError(email, jobId, job.error, processingMs);
-      return;
-    }
+  const rawSegments = Array.isArray(whisperResult.segments) ? whisperResult.segments : [];
+  const segments = rawSegments.map((seg, index) => ({
+    id: typeof seg.id === 'number' ? seg.id : index,
+    start: toTimestamp(seg.start),
+    end: toTimestamp(seg.end),
+    start_seconds: Number(seg.start) || 0,
+    end_seconds: Number(seg.end) || 0,
+    text: (seg.text || '').trim(),
+  }));
 
-    let whisperResult;
-    try {
-      whisperResult = JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
-    } catch (parseErr) {
-      safeUnlink(jsonPath);
-      job.status = 'error';
-      job.error = `Failed to parse Whisper output: ${parseErr.message}`;
-      notifyJobError(email, jobId, job.error, processingMs);
-      return;
-    }
+  const durationSeconds =
+    segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
 
-    // Output JSON is no longer needed once read.
-    safeUnlink(jsonPath);
+  currentJob.status = 'done';
+  currentJob.result = {
+    text: (whisperResult.text || '').trim(),
+    language: whisperResult.language || language,
+    duration_seconds: durationSeconds,
+    segments,
+    metadata: {
+      original_filename: originalFilename,
+      model_used: model,
+      processed_at: new Date().toISOString(),
+      gdpr_note: GDPR_NOTE,
+    },
+  };
 
-    const rawSegments = Array.isArray(whisperResult.segments) ? whisperResult.segments : [];
-    const segments = rawSegments.map((seg, index) => ({
-      id: typeof seg.id === 'number' ? seg.id : index,
-      start: toTimestamp(seg.start),
-      end: toTimestamp(seg.end),
-      start_seconds: Number(seg.start) || 0,
-      end_seconds: Number(seg.end) || 0,
-      text: (seg.text || '').trim(),
-    }));
-
-    const durationSeconds =
-      segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
-
-    job.status = 'done';
-    job.result = {
-      text: (whisperResult.text || '').trim(),
-      language: whisperResult.language || language,
-      duration_seconds: durationSeconds,
-      segments,
-      metadata: {
-        original_filename: originalFilename,
-        model_used: model,
-        processed_at: new Date().toISOString(),
-        gdpr_note: GDPR_NOTE,
-      },
-    };
-
-    notifyJobSuccess(email, jobId, job.result, processingMs);
-  });
+  notifyJobSuccess(email, jobId, currentJob.result, processingMs);
 }
 
 // ---------------------------------------------------------------------------
@@ -323,7 +336,8 @@ app.post('/transcribe', (req, res) => {
     setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 
     // Kick off Whisper in the background — do NOT await it.
-    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email });
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email })
+      .catch((err) => console.error(`[job:${jobId}] Unhandled error:`, err.message));
 
     res.json({ job_id: jobId, status: 'processing' });
   });
