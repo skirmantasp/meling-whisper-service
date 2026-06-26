@@ -36,14 +36,22 @@ def transcribe():
     data = request.get_json(force=True)
     input_path = data["input"]
     language = data.get("language", "no")
+    # Optional comma-separated names/places/terms supplied by the caller. Passed
+    # to faster-whisper as initial_prompt so the model is primed to recognize
+    # proper nouns (e.g. "Observatøren") rather than hallucinating similar-
+    # sounding phrases.
+    context = (data.get("context") or "").strip()
+
+    transcribe_kwargs = {
+        "language": language,
+        "beam_size": 5,
+        "vad_filter": True,
+    }
+    if context:
+        transcribe_kwargs["initial_prompt"] = context
 
     with _model_lock:
-        segments_iter, info = model.transcribe(
-            input_path,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-        )
+        segments_iter, info = model.transcribe(input_path, **transcribe_kwargs)
 
         segments = []
         text_parts = []

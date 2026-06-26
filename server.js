@@ -213,9 +213,9 @@ app.get('/health', (req, res) => {
  * The server holds the model in memory between calls, so there is no
  * per-request model load penalty.
  */
-function callWhisperServer(inputPath, language) {
+function callWhisperServer(inputPath, language, context) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify({ input: inputPath, language });
+    const body = JSON.stringify({ input: inputPath, language, context: context || '' });
     const options = {
       hostname: '127.0.0.1',
       port: 8765,
@@ -366,7 +366,7 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
 
   let whisperResult;
   try {
-    whisperResult = await callWhisperServer(inputPath, language);
+    whisperResult = await callWhisperServer(inputPath, language, context);
   } catch (err) {
     safeUnlink(inputPath);
     const currentJob = jobs.get(jobId);
