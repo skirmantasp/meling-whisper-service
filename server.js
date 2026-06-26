@@ -7,12 +7,20 @@ const http = require('http');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { Anthropic } = require('@anthropic-ai/sdk');
 
 const app = express();
 
 const PORT = process.env.PORT || 3000;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'NbAiLab/nb-whisper-large-v3';
+const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const DEFAULT_LANGUAGE = 'no';
+
+// Anthropic client — reads ANTHROPIC_API_KEY from the environment. The SDK
+// constructor throws when no key is present, so only construct it when the key
+// exists; analyzeTranscript no-ops when the client is null, letting transcription
+// run without an Anthropic key.
+const anthropic = process.env.ANTHROPIC_API_KEY ? new Anthropic() : null;
 const GDPR_NOTE =
   'All audio is processed in-memory on EU infrastructure (Railway EU-West, Amsterdam) ' +
   'using the open-source NB-Whisper Norwegian model. No audio or transcript leaves the EU, ' +
@@ -244,6 +252,104 @@ function callWhisperServer(inputPath, language) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude post-processing
+// ---------------------------------------------------------------------------
+
+// JSON schema constraining Claude's response. Every property is required and
+// objects disallow extras, as the structured-outputs API requires. For HIGH
+// confidence segments, `suggestion` and `reason` are returned as empty strings.
+const ANALYSIS_SCHEMA = {
+  type: 'object',
+  properties: {
+    segments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          id: { type: 'integer' },
+          confidence: { type: 'string', enum: ['HIGH', 'LOW'] },
+          suggestion: { type: 'string' },
+          reason: { type: 'string' },
+        },
+        required: ['id', 'confidence', 'suggestion', 'reason'],
+        additionalProperties: false,
+      },
+    },
+    summary: { type: 'string' },
+    flagged_count: { type: 'integer' },
+  },
+  required: ['segments', 'summary', 'flagged_count'],
+  additionalProperties: false,
+};
+
+/**
+ * Ask Claude to review the transcript segments. Returns the structured analysis
+ * object, or null if analysis is unavailable (no API key, no segments). Throws
+ * on an actual API/parse failure so the caller can record it on the job.
+ */
+async function analyzeTranscript({ segments, context }) {
+  if (!anthropic) {
+    console.warn('[claude] ANTHROPIC_API_KEY not configured; skipping analysis.');
+    return null;
+  }
+  if (!Array.isArray(segments) || segments.length === 0) {
+    return null;
+  }
+
+  // Send only the id + text of each segment — timestamps aren't needed for review.
+  const segmentInput = segments.map((seg) => ({ id: seg.id, text: seg.text }));
+
+  const contextBlock =
+    context && context.trim()
+      ? `\n\nKontekst oppgitt av brukeren (navn, steder, fagtermer som kan forekomme):\n${context.trim()}\n`
+      : '';
+
+  const system =
+    'Du er en assistent som kvalitetssikrer norske transkripsjoner for et advokatfirma. ' +
+    'Du vurderer hvert segment og flagger de som sannsynligvis inneholder transkripsjonsfeil ' +
+    '(feilstavede navn/steder, ord som ikke gir mening i konteksten, sannsynlig feilhørte ord). ' +
+    'For hvert segment setter du confidence til "HIGH" når teksten virker korrekt, eller "LOW" ' +
+    'når den bør gjennomgås. For "LOW"-segmenter gir du en korrigert versjon i "suggestion" og ' +
+    'en kort begrunnelse i "reason" (på norsk). For "HIGH"-segmenter skal "suggestion" og "reason" ' +
+    'være tomme strenger. Du skriver også et kort sammendrag av hele transkripsjonen på norsk i ' +
+    '"summary", og angir antall flaggede segmenter i "flagged_count".';
+
+  const userText =
+    'Gjennomgå følgende transkripsjonssegmenter.' +
+    contextBlock +
+    '\n\nSegmenter (JSON):\n' +
+    JSON.stringify(segmentInput);
+
+  // Stream the response so a large transcript doesn't risk an HTTP timeout.
+  const stream = anthropic.messages.stream({
+    model: CLAUDE_MODEL,
+    max_tokens: 32000,
+    thinking: { type: 'adaptive' },
+    system,
+    output_config: { format: { type: 'json_schema', schema: ANALYSIS_SCHEMA } },
+    messages: [{ role: 'user', content: userText }],
+  });
+
+  const message = await stream.finalMessage();
+
+  if (message.stop_reason === 'refusal') {
+    throw new Error('Claude refused to analyze the transcript.');
+  }
+
+  const textBlock = message.content.find((block) => block.type === 'text');
+  if (!textBlock) {
+    throw new Error('Claude response contained no text block.');
+  }
+
+  const analysis = JSON.parse(textBlock.text);
+
+  // Recompute flagged_count server-side so it's always consistent with segments.
+  analysis.flagged_count = analysis.segments.filter((s) => s.confidence === 'LOW').length;
+
+  return analysis;
+}
+
+// ---------------------------------------------------------------------------
 // Background transcription runner
 // ---------------------------------------------------------------------------
 
@@ -252,7 +358,7 @@ function callWhisperServer(inputPath, language) {
  * update the job entry in `jobs` when it completes or fails. Never throws;
  * all outcomes are recorded on the job.
  */
-async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email }) {
+async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context }) {
   const job = jobs.get(jobId);
   if (!job) return;
 
@@ -292,7 +398,6 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
   const durationSeconds =
     segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
 
-  currentJob.status = 'done';
   currentJob.result = {
     text: (whisperResult.text || '').trim(),
     language: whisperResult.language || language,
@@ -305,6 +410,20 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
       gdpr_note: GDPR_NOTE,
     },
   };
+
+  // Post-process the transcript with Claude. Failures here are non-fatal — the
+  // transcript is still delivered, with the analysis error recorded on the job.
+  currentJob.analysis = null;
+  currentJob.analysis_error = null;
+  try {
+    console.log(`[claude:${jobId}] Analyzing ${segments.length} segments with ${CLAUDE_MODEL}`);
+    currentJob.analysis = await analyzeTranscript({ segments, context });
+  } catch (err) {
+    console.error(`[claude:${jobId}] Analysis failed:`, err.message);
+    currentJob.analysis_error = err.message || 'Claude analysis failed.';
+  }
+
+  currentJob.status = 'done';
 
   notifyJobSuccess(email, jobId, currentJob.result, processingMs);
 }
@@ -328,15 +447,24 @@ app.post('/transcribe', (req, res) => {
     const language = (req.body && req.body.language) || DEFAULT_LANGUAGE;
     const model = WHISPER_MODEL;
     const email = (req.body && typeof req.body.email === 'string' && req.body.email.trim()) || null;
+    const context =
+      (req.body && typeof req.body.context === 'string' && req.body.context.trim()) || null;
 
     const jobId = crypto.randomUUID();
-    jobs.set(jobId, { status: 'processing', result: null, error: null, created_at: Date.now(), email });
+    jobs.set(jobId, {
+      status: 'processing',
+      result: null,
+      analysis: null,
+      error: null,
+      created_at: Date.now(),
+      email,
+    });
 
     // Drop the job entry after one hour so the Map does not grow unbounded.
     setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 
     // Kick off Whisper in the background — do NOT await it.
-    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email })
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context })
       .catch((err) => console.error(`[job:${jobId}] Unhandled error:`, err.message));
 
     res.json({ job_id: jobId, status: 'processing' });
@@ -354,7 +482,12 @@ app.get('/status/:job_id', (req, res) => {
   }
 
   if (job.status === 'done') {
-    return res.json({ status: 'done', result: job.result });
+    return res.json({
+      status: 'done',
+      result: job.result,
+      analysis: job.analysis,
+      analysis_error: job.analysis_error || null,
+    });
   }
   if (job.status === 'error') {
     return res.json({ status: 'error', error: job.error });
