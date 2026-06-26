@@ -555,6 +555,63 @@ app.post('/search', (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// POST /chat  — answer a lawyer's question about a transcript via Claude
+// ---------------------------------------------------------------------------
+
+const CHAT_SYSTEM_PROMPT =
+  'Du er en juridisk assistent. Brukeren er en norsk advokat. ' +
+  'Svar alltid på norsk. Du har tilgang til en transkripsjon av et lydopptak. ' +
+  'Svar på spørsmål basert kun på innholdet i transkripsjonen.';
+
+app.post('/chat', async (req, res) => {
+  const { jobId, question, transcript } = req.body || {};
+
+  if (!question || typeof question !== 'string' || !question.trim()) {
+    return res.status(400).json({ error: 'Body must include a non-empty "question" string.' });
+  }
+  if (!Array.isArray(transcript)) {
+    return res.status(400).json({ error: 'Body must include a "transcript" array of segments.' });
+  }
+  if (!anthropic) {
+    return res.status(503).json({ error: 'Chat is unavailable: ANTHROPIC_API_KEY is not configured.' });
+  }
+
+  // Flatten the segments into a timestamped transcript Claude can read.
+  const transcriptText = transcript
+    .map((seg) => {
+      const stamp = seg && seg.start != null ? `[${seg.start}] ` : '';
+      return `${stamp}${(seg && seg.text) || ''}`.trim();
+    })
+    .filter(Boolean)
+    .join('\n');
+
+  const userText =
+    'Her er transkripsjonen av lydopptaket:\n\n' +
+    transcriptText +
+    '\n\nSpørsmål fra advokaten:\n' +
+    question.trim();
+
+  try {
+    console.log(`[chat:${jobId || 'n/a'}] Answering question over ${transcript.length} segments with ${CLAUDE_MODEL}`);
+
+    const message = await anthropic.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 2000,
+      system: CHAT_SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userText }],
+    });
+
+    const textBlock = message.content.find((block) => block.type === 'text');
+    const answer = textBlock ? textBlock.text : 'Beklager, jeg klarte ikke å svare på spørsmålet.';
+
+    res.json({ answer });
+  } catch (err) {
+    console.error(`[chat:${jobId || 'n/a'}] Failed:`, err.message);
+    res.status(500).json({ error: 'Kunne ikke hente svar fra assistenten.' });
+  }
+});
+
+// ---------------------------------------------------------------------------
 // Error handler (catches stray multer / express errors)
 // ---------------------------------------------------------------------------
 app.use((err, req, res, next) => {
