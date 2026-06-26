@@ -5,10 +5,8 @@
 # ---------------------------------------------------------------------------
 FROM python:3.11-slim AS converter
 
-RUN pip install --no-cache-dir \
-    torch --index-url https://download.pytorch.org/whl/cpu \
-    transformers \
-    ctranslate2
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+RUN pip install --no-cache-dir transformers ctranslate2
 
 ARG WHISPER_MODEL=NbAiLab/nb-whisper-medium
 RUN ct2-transformers-converter \
