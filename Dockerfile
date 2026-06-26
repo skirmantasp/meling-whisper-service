@@ -8,10 +8,10 @@ FROM python:3.11-slim AS converter
 RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
 RUN pip install --no-cache-dir transformers ctranslate2
 
-ARG WHISPER_MODEL=NbAiLab/nb-whisper-medium
+ARG WHISPER_MODEL=NbAiLab/nb-whisper-large-v3
 RUN ct2-transformers-converter \
     --model "${WHISPER_MODEL}" \
-    --output_dir /models/nb-whisper-medium-ct2 \
+    --output_dir /models/nb-whisper-large-v3-ct2 \
     --quantization int8 \
     --force
 
@@ -42,8 +42,8 @@ RUN chmod +x /app/start.sh
 RUN mkdir -p /tmp/whisper-uploads /tmp/whisper-output
 
 ENV PORT=3000
-ENV WHISPER_MODEL=NbAiLab/nb-whisper-medium
-ENV WHISPER_MODEL_PATH=/models/nb-whisper-medium-ct2
+ENV WHISPER_MODEL=NbAiLab/nb-whisper-large-v3
+ENV WHISPER_MODEL_PATH=/models/nb-whisper-large-v3-ct2
 
 EXPOSE 3000
 CMD ["/app/start.sh"]

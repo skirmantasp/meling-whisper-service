@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const app = express();
 
 const PORT = process.env.PORT || 3000;
-const WHISPER_MODEL = process.env.WHISPER_MODEL || 'NbAiLab/nb-whisper-medium';
+const WHISPER_MODEL = process.env.WHISPER_MODEL || 'NbAiLab/nb-whisper-large-v3';
 const DEFAULT_LANGUAGE = 'no';
 const GDPR_NOTE =
   'All audio is processed in-memory on EU infrastructure (Railway EU-West, Amsterdam) ' +

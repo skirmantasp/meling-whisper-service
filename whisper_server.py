@@ -19,7 +19,7 @@ from faster_whisper import WhisperModel
 app = Flask(__name__)
 _model_lock = threading.Lock()
 
-MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "/models/nb-whisper-medium-ct2")
+MODEL_PATH = os.environ.get("WHISPER_MODEL_PATH", "/models/nb-whisper-large-v3-ct2")
 
 print(f"[whisper-server] Loading model from {MODEL_PATH} ...", flush=True)
 model = WhisperModel(MODEL_PATH, device="cpu", compute_type="int8")
