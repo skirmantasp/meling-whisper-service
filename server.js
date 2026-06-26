@@ -358,7 +358,7 @@ async function analyzeTranscript({ segments, context }) {
  * update the job entry in `jobs` when it completes or fails. Never throws;
  * all outcomes are recorded on the job.
  */
-async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context }) {
+async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze }) {
   const job = jobs.get(jobId);
   if (!job) return;
 
@@ -411,16 +411,24 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
     },
   };
 
-  // Post-process the transcript with Claude. Failures here are non-fatal — the
-  // transcript is still delivered, with the analysis error recorded on the job.
+  // Post-process the transcript with Claude only when the client opted in.
+  // Analysis sends the transcript to the Anthropic API (outside the EU), so
+  // when it runs we surface a GDPR notice on the result. Failures here are
+  // non-fatal — the transcript is still delivered, with the analysis error
+  // recorded on the job.
   currentJob.analysis = null;
   currentJob.analysis_error = null;
-  try {
-    console.log(`[claude:${jobId}] Analyzing ${segments.length} segments with ${CLAUDE_MODEL}`);
-    currentJob.analysis = await analyzeTranscript({ segments, context });
-  } catch (err) {
-    console.error(`[claude:${jobId}] Analysis failed:`, err.message);
-    currentJob.analysis_error = err.message || 'Claude analysis failed.';
+  if (analyze) {
+    currentJob.result.analysis_gdpr_notice =
+      'Legal analysis processed via Anthropic API (outside EU). ' +
+      'Enable only if you accept this.';
+    try {
+      console.log(`[claude:${jobId}] Analyzing ${segments.length} segments with ${CLAUDE_MODEL}`);
+      currentJob.analysis = await analyzeTranscript({ segments, context });
+    } catch (err) {
+      console.error(`[claude:${jobId}] Analysis failed:`, err.message);
+      currentJob.analysis_error = err.message || 'Claude analysis failed.';
+    }
   }
 
   currentJob.status = 'done';
@@ -449,6 +457,10 @@ app.post('/transcribe', (req, res) => {
     const email = (req.body && typeof req.body.email === 'string' && req.body.email.trim()) || null;
     const context =
       (req.body && typeof req.body.context === 'string' && req.body.context.trim()) || null;
+    // Claude analysis is opt-in. It sends the transcript to the Anthropic API
+    // (outside the EU), so it only runs when the client explicitly requests it.
+    const analyze = Boolean(req.body && req.body.analyze === true) ||
+      Boolean(req.body && req.body.analyze === 'true');
 
     const jobId = crypto.randomUUID();
     jobs.set(jobId, {
@@ -464,7 +476,7 @@ app.post('/transcribe', (req, res) => {
     setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
 
     // Kick off Whisper in the background — do NOT await it.
-    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context })
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze })
       .catch((err) => console.error(`[job:${jobId}] Unhandled error:`, err.message));
 
     res.json({ job_id: jobId, status: 'processing' });
