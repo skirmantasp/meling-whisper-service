@@ -61,7 +61,7 @@ app.use(cors({
     'http://localhost:5173',
     'http://localhost:3000'
   ],
-  methods: ['GET', 'POST', 'DELETE'],
+  methods: ['GET', 'POST', 'DELETE', 'PATCH'],
   allowedHeaders: ['Content-Type']
 }));
 app.use((req, res, next) => {
@@ -660,6 +660,7 @@ app.get('/status/:job_id', async (req, res) => {
       analysis_error: job.analysis_error || null,
       case_number: job.case_number || null,
       has_audio: Boolean(job.audio_filename),
+      segment_edits: job.segment_edits || {},
     });
   }
   if (job.status === 'error') {
@@ -699,6 +700,44 @@ app.post('/job/:jobId/case', async (req, res) => {
   }
 
   res.json({ job_id: jobId, case_number: caseNumber });
+});
+
+// ---------------------------------------------------------------------------
+// PATCH /job/:jobId/segment/:segmentIndex  — save an edited segment's text.
+// Edits are merged into the segment_edits JSONB object, keyed by segment index.
+// ---------------------------------------------------------------------------
+app.patch('/job/:jobId/segment/:segmentIndex', async (req, res) => {
+  const { jobId, segmentIndex } = req.params;
+
+  // The index must be a non-negative integer so we don't write junk keys.
+  if (!/^\d+$/.test(segmentIndex)) {
+    return res.status(400).json({ error: 'Segment index must be a non-negative integer.' });
+  }
+  const text = req.body && req.body.text;
+  if (typeof text !== 'string') {
+    return res.status(400).json({ error: '"text" must be a string.' });
+  }
+
+  let job;
+  try {
+    job = await db.getJob(jobId);
+  } catch (dbErr) {
+    console.error(`[segment:${jobId}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not look up job.' });
+  }
+  if (!job) {
+    return res.status(404).json({ error: 'Unknown or expired job ID.' });
+  }
+
+  const edits = { ...(job.segment_edits || {}), [segmentIndex]: text };
+  try {
+    await db.updateJob(jobId, { segment_edits: JSON.stringify(edits) });
+  } catch (dbErr) {
+    console.error(`[segment:${jobId}] Failed to save segment edit:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not save segment edit.' });
+  }
+
+  res.json({ job_id: jobId, segment_edits: edits });
 });
 
 // ---------------------------------------------------------------------------

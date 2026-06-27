@@ -53,6 +53,7 @@ async function initDb() {
       error          TEXT,
       case_number    TEXT,
       audio_filename TEXT,
+      segment_edits  JSONB,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
     )
@@ -60,6 +61,7 @@ async function initDb() {
   // Migrations for databases created before these columns existed.
   await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS case_number TEXT');
   await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS audio_filename TEXT');
+  await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS segment_edits JSONB');
 }
 
 /** Insert a freshly-created job. created_at/updated_at default to NOW(). */
@@ -92,6 +94,7 @@ async function getJob(id) {
     error: r.error || null,
     case_number: r.case_number || null,
     audio_filename: r.audio_filename || null,
+    segment_edits: r.segment_edits || null,
     created_at: r.created_at,
     updated_at: r.updated_at,
   };
@@ -109,6 +112,7 @@ const UPDATABLE_COLUMNS = new Set([
   'error',
   'case_number',
   'audio_filename',
+  'segment_edits',
 ]);
 
 /**
