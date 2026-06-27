@@ -59,7 +59,7 @@ app.use(cors({
     'http://localhost:5173',
     'http://localhost:3000'
   ],
-  methods: ['GET', 'POST'],
+  methods: ['GET', 'POST', 'DELETE'],
   allowedHeaders: ['Content-Type']
 }));
 app.use((req, res, next) => {
@@ -854,9 +854,9 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: err.message });
 });
 
-// Initialise the database (create the jobs table) and start the periodic TTL
-// sweep. A DB failure here is logged but never crashes the server — the rest of
-// the service stays up and individual DB operations fail gracefully.
+// Initialise the database (create the jobs table). A DB failure here is logged
+// but never crashes the server — the rest of the service stays up and
+// individual DB operations fail gracefully.
 db.initDb()
   .then(() => {
     console.log('✅ Database ready (jobs table ensured).');
