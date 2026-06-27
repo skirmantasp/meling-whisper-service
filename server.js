@@ -37,12 +37,20 @@ for (const dir of [UPLOAD_DIR, OUTPUT_DIR]) {
 }
 
 const ALLOWED_EXTENSIONS = ['.mp3', '.wav', '.mp4', '.m4a', '.ogg', '.webm', '.flac'];
-const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB — large legal recordings (several hours)
+
+// Timeouts sized for large legal audio. Uploading up to 500 MB over a slow
+// connection can take many minutes, and CPU transcription of a multi-hour
+// recording runs far longer than the old 10-minute cap.
+const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;            // 60 min — HTTP upload socket/request
+const TRANSCRIPTION_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4 h   — Whisper inference call
 
 // In-memory registry of async transcription jobs. Each entry:
 //   { status: 'processing' | 'done' | 'error', result, error, created_at }
 const jobs = new Map();
-const JOB_TTL_MS = 60 * 60 * 1000; // 1 hour
+// Keep jobs alive long enough to cover a multi-hour transcription plus the
+// client's polling/result retrieval afterwards.
+const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
 app.use(cors({
   origin: [
@@ -54,10 +62,12 @@ app.use(cors({
   allowedHeaders: ['Content-Type']
 }));
 app.use((req, res, next) => {
-  res.setTimeout(600000); // 10 minutes
+  res.setTimeout(UPLOAD_TIMEOUT_MS);
   next();
 });
-app.use(express.json({ limit: '50mb' }));
+// 100 MB headroom for JSON endpoints (/chat, /search) that carry the full
+// transcript of a multi-hour recording. File uploads do not go through here.
+app.use(express.json({ limit: '100mb' }));
 
 // ---------------------------------------------------------------------------
 // Multer configuration
@@ -225,7 +235,7 @@ function callWhisperServer(inputPath, language, context) {
         'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
-      timeout: 600000,
+      timeout: TRANSCRIPTION_TIMEOUT_MS,
     };
 
     const req = http.request(options, (res) => {
@@ -245,7 +255,7 @@ function callWhisperServer(inputPath, language, context) {
     });
 
     req.on('error', reject);
-    req.on('timeout', () => req.destroy(new Error('Whisper transcription timed out after 10 minutes')));
+    req.on('timeout', () => req.destroy(new Error('Whisper transcription timed out after 4 hours')));
     req.write(body);
     req.end();
   });
@@ -731,4 +741,9 @@ const server = app.listen(PORT, () => {
   console.log(`   Model: ${process.env.WHISPER_MODEL || 'medium'}`);
   console.log(`   GDPR: EU-only processing`);
 });
-server.timeout = 600000; // 10 minutes
+// Socket inactivity timeout. Large uploads stream continuously so they stay
+// active, but allow generous headroom. requestTimeout overrides Node's ~5 min
+// default, which would otherwise abort a large/slow upload (e.g. 500 MB, or a
+// 67 MB file on a slow connection) mid-stream. headersTimeout left at default.
+server.timeout = UPLOAD_TIMEOUT_MS;
+server.requestTimeout = UPLOAD_TIMEOUT_MS;
