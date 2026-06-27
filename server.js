@@ -647,12 +647,82 @@ app.get('/status/:job_id', async (req, res) => {
       summary_error: job.summary_error || null,
       analysis: job.analysis,
       analysis_error: job.analysis_error || null,
+      case_number: job.case_number || null,
     });
   }
   if (job.status === 'error') {
     return res.json({ status: 'error', error: job.error });
   }
   return res.json({ status: 'processing' });
+});
+
+// ---------------------------------------------------------------------------
+// POST /job/:jobId/case  — assign (or clear) the case number for a job
+// ---------------------------------------------------------------------------
+app.post('/job/:jobId/case', async (req, res) => {
+  const jobId = req.params.jobId;
+  const raw = req.body && req.body.caseNumber;
+  if (raw !== undefined && raw !== null && typeof raw !== 'string') {
+    return res.status(400).json({ error: '"caseNumber" must be a string.' });
+  }
+  // Trim; an empty value clears the assignment.
+  const caseNumber = (typeof raw === 'string' && raw.trim()) || null;
+
+  let job;
+  try {
+    job = await db.getJob(jobId);
+  } catch (dbErr) {
+    console.error(`[case:${jobId}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not look up job.' });
+  }
+  if (!job) {
+    return res.status(404).json({ error: 'Unknown or expired job ID.' });
+  }
+
+  try {
+    await db.updateJob(jobId, { case_number: caseNumber });
+  } catch (dbErr) {
+    console.error(`[case:${jobId}] Failed to save case number:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not save case number.' });
+  }
+
+  res.json({ job_id: jobId, case_number: caseNumber });
+});
+
+// ---------------------------------------------------------------------------
+// GET /cases  — all jobs grouped by case number for the "Mine saker" overview
+// ---------------------------------------------------------------------------
+app.get('/cases', async (req, res) => {
+  let jobs;
+  try {
+    jobs = await db.listJobs();
+  } catch (dbErr) {
+    console.error('[cases] DB lookup failed:', dbErr.message);
+    return res.status(500).json({ error: 'Could not list cases.' });
+  }
+
+  // Group by case_number, preserving the newest-first order from the query.
+  // Jobs without a case number are collected under a null key.
+  const groups = new Map();
+  for (const job of jobs) {
+    const key = job.case_number || null;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({
+      id: job.id,
+      filename: job.filename,
+      status: job.status,
+      created_at: job.created_at,
+    });
+  }
+
+  // Named cases first (alphabetically), with the "no case" bucket last.
+  const named = [...groups.keys()].filter((k) => k !== null).sort();
+  const cases = named.map((caseNumber) => ({ case_number: caseNumber, jobs: groups.get(caseNumber) }));
+  if (groups.has(null)) {
+    cases.push({ case_number: null, jobs: groups.get(null) });
+  }
+
+  res.json({ cases });
 });
 
 // ---------------------------------------------------------------------------

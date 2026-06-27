@@ -51,10 +51,13 @@ async function initDb() {
       summary_error  TEXT,
       analysis_error TEXT,
       error          TEXT,
+      case_number    TEXT,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
     )
   `);
+  // Migration for databases created before case assignment existed.
+  await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS case_number TEXT');
 }
 
 /** Insert a freshly-created job. created_at/updated_at default to NOW(). */
@@ -85,6 +88,7 @@ async function getJob(id) {
     analysis: r.analysis ? JSON.parse(r.analysis) : null,
     analysis_error: r.analysis_error || null,
     error: r.error || null,
+    case_number: r.case_number || null,
     created_at: r.created_at,
     updated_at: r.updated_at,
   };
@@ -100,6 +104,7 @@ const UPDATABLE_COLUMNS = new Set([
   'summary_error',
   'analysis_error',
   'error',
+  'case_number',
 ]);
 
 /**
@@ -122,6 +127,26 @@ async function updateJob(id, fields) {
   );
 }
 
+/**
+ * List all jobs (lightweight — no transcript/summary payloads) for the cases
+ * overview. Newest first. Each row: { id, filename, status, case_number,
+ * created_at }.
+ */
+async function listJobs() {
+  const { rows } = await pool.query(
+    `SELECT id, filename, status, case_number, created_at
+       FROM jobs
+       ORDER BY created_at DESC`
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    filename: r.filename || null,
+    status: r.status,
+    case_number: r.case_number || null,
+    created_at: r.created_at,
+  }));
+}
+
 /** Delete jobs older than 6 hours. Returns the number of rows removed. */
 async function deleteOldJobs() {
   const { rowCount } = await pool.query(
@@ -136,5 +161,6 @@ module.exports = {
   createJob,
   getJob,
   updateJob,
+  listJobs,
   deleteOldJobs,
 };
