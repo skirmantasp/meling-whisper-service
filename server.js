@@ -459,7 +459,7 @@ async function generateSummary({ text, context }) {
  * persist the outcome to the jobs table when it completes or fails. Never
  * throws; all outcomes are recorded on the job row.
  */
-async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze }) {
+async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze, keepAudio }) {
   // Read created_at once (set when the row was inserted) so processing time can
   // be reported even after a long transcription. Fall back to now if the row or
   // DB is unavailable.
@@ -487,7 +487,13 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
     return;
   }
 
-  safeUnlink(inputPath);
+  // Keep the audio file on disk for later playback when the user opted in;
+  // otherwise delete it immediately (the privacy-default behaviour). When kept,
+  // the basename is recorded on the job so GET /job/:jobId/audio can stream it.
+  const audioFilename = keepAudio ? path.basename(inputPath) : null;
+  if (!keepAudio) {
+    safeUnlink(inputPath);
+  }
 
   const processingMs = Date.now() - createdAtMs;
 
@@ -568,6 +574,7 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
       summary_error: summaryError,
       analysis: analysis === null ? null : JSON.stringify(analysis),
       analysis_error: analysisError,
+      audio_filename: audioFilename,
     });
   } catch (dbErr) {
     console.error(`[transcribe:${jobId}] Failed to persist result:`, dbErr.message);
@@ -601,6 +608,9 @@ app.post('/transcribe', (req, res) => {
     // (outside the EU), so it only runs when the client explicitly requests it.
     const analyze = Boolean(req.body && req.body.analyze === true) ||
       Boolean(req.body && req.body.analyze === 'true');
+    // Whether to retain the audio file on the server for later playback.
+    // Defaults to true; only an explicit "false" opts out.
+    const keepAudio = !(req.body && (req.body.keepAudio === 'false' || req.body.keepAudio === false));
 
     const jobId = crypto.randomUUID();
 
@@ -615,7 +625,7 @@ app.post('/transcribe', (req, res) => {
     }
 
     // Kick off Whisper in the background — do NOT await it.
-    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze })
+    runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze, keepAudio })
       .catch((err) => console.error(`[job:${jobId}] Unhandled error:`, err.message));
 
     res.json({ job_id: jobId, status: 'processing' });
@@ -647,6 +657,7 @@ app.get('/status/:job_id', async (req, res) => {
       analysis: job.analysis,
       analysis_error: job.analysis_error || null,
       case_number: job.case_number || null,
+      has_audio: Boolean(job.audio_filename),
     });
   }
   if (job.status === 'error') {
@@ -693,17 +704,91 @@ app.post('/job/:jobId/case', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.delete('/job/:jobId', async (req, res) => {
   const jobId = req.params.jobId;
-  let deleted;
+
+  // Look the job up first so we can also remove its audio file from disk.
+  let job;
   try {
-    deleted = await db.deleteJob(jobId);
+    job = await db.getJob(jobId);
+  } catch (dbErr) {
+    console.error(`[delete:${jobId}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not delete job.' });
+  }
+  if (!job) {
+    return res.status(404).json({ error: 'Unknown or expired job ID.' });
+  }
+
+  if (job.audio_filename) {
+    safeUnlink(path.join(UPLOAD_DIR, path.basename(job.audio_filename)));
+  }
+
+  try {
+    await db.deleteJob(jobId);
   } catch (dbErr) {
     console.error(`[delete:${jobId}] Failed to delete job:`, dbErr.message);
     return res.status(500).json({ error: 'Could not delete job.' });
   }
-  if (!deleted) {
+  res.status(200).json({ job_id: jobId, deleted: true });
+});
+
+// ---------------------------------------------------------------------------
+// GET /job/:jobId/audio  — stream the retained audio file for playback
+// ---------------------------------------------------------------------------
+app.get('/job/:jobId/audio', async (req, res) => {
+  const jobId = req.params.jobId;
+  let job;
+  try {
+    job = await db.getJob(jobId);
+  } catch (dbErr) {
+    console.error(`[audio:${jobId}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not look up job.' });
+  }
+  if (!job || !job.audio_filename) {
+    return res.status(404).json({ error: 'No audio available for this job.' });
+  }
+
+  // path.basename guards against any path traversal via the stored name.
+  const absPath = path.join(UPLOAD_DIR, path.basename(job.audio_filename));
+  if (!fs.existsSync(absPath)) {
+    return res.status(404).json({ error: 'Audio file not found on disk.' });
+  }
+
+  // sendFile streams the file and honours HTTP Range requests, so the browser
+  // can seek to a segment's timestamp without downloading the whole file.
+  res.sendFile(absPath, (err) => {
+    if (err && !res.headersSent) {
+      console.error(`[audio:${jobId}] Failed to send file:`, err.message);
+      res.status(500).json({ error: 'Could not stream audio.' });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /job/:jobId/audio  — delete just the audio file, keep the transcript
+// ---------------------------------------------------------------------------
+app.delete('/job/:jobId/audio', async (req, res) => {
+  const jobId = req.params.jobId;
+  let job;
+  try {
+    job = await db.getJob(jobId);
+  } catch (dbErr) {
+    console.error(`[audio:${jobId}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not look up job.' });
+  }
+  if (!job) {
     return res.status(404).json({ error: 'Unknown or expired job ID.' });
   }
-  res.status(200).json({ job_id: jobId, deleted: true });
+
+  if (job.audio_filename) {
+    safeUnlink(path.join(UPLOAD_DIR, path.basename(job.audio_filename)));
+    try {
+      await db.updateJob(jobId, { audio_filename: null });
+    } catch (dbErr) {
+      console.error(`[audio:${jobId}] Failed to clear audio_filename:`, dbErr.message);
+      return res.status(500).json({ error: 'Could not update job.' });
+    }
+  }
+
+  res.status(200).json({ job_id: jobId, audio_deleted: true });
 });
 
 // ---------------------------------------------------------------------------

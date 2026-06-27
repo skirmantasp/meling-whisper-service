@@ -52,12 +52,14 @@ async function initDb() {
       analysis_error TEXT,
       error          TEXT,
       case_number    TEXT,
+      audio_filename TEXT,
       created_at     TIMESTAMPTZ DEFAULT NOW(),
       updated_at     TIMESTAMPTZ DEFAULT NOW()
     )
   `);
-  // Migration for databases created before case assignment existed.
+  // Migrations for databases created before these columns existed.
   await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS case_number TEXT');
+  await pool.query('ALTER TABLE jobs ADD COLUMN IF NOT EXISTS audio_filename TEXT');
 }
 
 /** Insert a freshly-created job. created_at/updated_at default to NOW(). */
@@ -89,6 +91,7 @@ async function getJob(id) {
     analysis_error: r.analysis_error || null,
     error: r.error || null,
     case_number: r.case_number || null,
+    audio_filename: r.audio_filename || null,
     created_at: r.created_at,
     updated_at: r.updated_at,
   };
@@ -105,6 +108,7 @@ const UPDATABLE_COLUMNS = new Set([
   'analysis_error',
   'error',
   'case_number',
+  'audio_filename',
 ]);
 
 /**
