@@ -507,6 +507,10 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
     start_seconds: Number(seg.start) || 0,
     end_seconds: Number(seg.end) || 0,
     text: (seg.text || '').trim(),
+    // Per-segment confidence signals from Whisper (used by the UI to flag
+    // uncertain transcription). Null when the model didn't report them.
+    avg_logprob: typeof seg.avg_logprob === 'number' ? seg.avg_logprob : null,
+    no_speech_prob: typeof seg.no_speech_prob === 'number' ? seg.no_speech_prob : null,
   }));
 
   const durationSeconds =

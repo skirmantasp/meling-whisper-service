@@ -62,6 +62,10 @@ def transcribe():
                 "start": float(seg.start),
                 "end": float(seg.end),
                 "text": text,
+                # Per-segment confidence signals used by the UI to flag uncertain
+                # transcription (low avg log-prob or likely no speech).
+                "avg_logprob": float(seg.avg_logprob),
+                "no_speech_prob": float(seg.no_speech_prob),
             })
             if text:
                 text_parts.append(text)
