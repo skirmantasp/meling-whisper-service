@@ -604,7 +604,10 @@ app.post('/transcribe', (req, res) => {
     }
 
     const inputPath = req.file.path;
-    const originalFilename = req.file.originalname;
+    // Multer/busboy decodes the multipart filename as latin1, which mangles
+    // UTF-8 names (e.g. "Løkkeveien" → "LÃ¸kkeveien"). Re-decode the bytes as
+    // UTF-8 to recover the original characters.
+    const originalFilename = Buffer.from(req.file.originalname, 'latin1').toString('utf8');
     const language = (req.body && req.body.language) || DEFAULT_LANGUAGE;
     const model = WHISPER_MODEL;
     const email = (req.body && typeof req.body.email === 'string' && req.body.email.trim()) || null;
