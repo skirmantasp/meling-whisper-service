@@ -50,9 +50,8 @@ const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;            // 60 min — HTTP upload s
 const TRANSCRIPTION_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4 h   — Whisper inference call
 
 // Transcription jobs are persisted in PostgreSQL (see db.js) so they survive
-// server restarts/redeploys. Rows older than 6 hours are purged by a periodic
-// sweep (see CLEANUP_INTERVAL_MS below).
-const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // run TTL cleanup every 30 minutes
+// server restarts/redeploys. Jobs are kept until manually deleted via
+// DELETE /job/:jobId — there is no automatic TTL cleanup.
 
 app.use(cors({
   origin: [
@@ -690,6 +689,24 @@ app.post('/job/:jobId/case', async (req, res) => {
 });
 
 // ---------------------------------------------------------------------------
+// DELETE /job/:jobId  — permanently remove a job from the database
+// ---------------------------------------------------------------------------
+app.delete('/job/:jobId', async (req, res) => {
+  const jobId = req.params.jobId;
+  let deleted;
+  try {
+    deleted = await db.deleteJob(jobId);
+  } catch (dbErr) {
+    console.error(`[delete:${jobId}] Failed to delete job:`, dbErr.message);
+    return res.status(500).json({ error: 'Could not delete job.' });
+  }
+  if (!deleted) {
+    return res.status(404).json({ error: 'Unknown or expired job ID.' });
+  }
+  res.status(200).json({ job_id: jobId, deleted: true });
+});
+
+// ---------------------------------------------------------------------------
 // GET /cases  — all jobs grouped by case number for the "Mine saker" overview
 // ---------------------------------------------------------------------------
 app.get('/cases', async (req, res) => {
@@ -847,17 +864,6 @@ db.initDb()
   .catch((err) => {
     console.error('[db] Initialisation failed (server will continue):', err.message);
   });
-
-// Purge jobs older than 6 hours every 30 minutes. Self-contained try/catch so a
-// transient DB error doesn't take down the interval.
-setInterval(async () => {
-  try {
-    const removed = await db.deleteOldJobs();
-    if (removed > 0) console.log(`[db] Cleaned up ${removed} job(s) older than 6 hours.`);
-  } catch (err) {
-    console.error('[db] TTL cleanup failed:', err.message);
-  }
-}, CLEANUP_INTERVAL_MS);
 
 const server = app.listen(PORT, () => {
   console.log(`✅ Meling Whisper Service running on port ${PORT}`);

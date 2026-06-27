@@ -147,12 +147,11 @@ async function listJobs() {
   }));
 }
 
-/** Delete jobs older than 6 hours. Returns the number of rows removed. */
-async function deleteOldJobs() {
-  const { rowCount } = await pool.query(
-    "DELETE FROM jobs WHERE created_at < NOW() - INTERVAL '6 hours'"
-  );
-  return rowCount;
+/** Delete a single job by id. Returns true if a row was removed, false if no
+ * job with that id existed. */
+async function deleteJob(id) {
+  const { rowCount } = await pool.query('DELETE FROM jobs WHERE id = $1', [id]);
+  return rowCount > 0;
 }
 
 module.exports = {
@@ -162,5 +161,5 @@ module.exports = {
   getJob,
   updateJob,
   listJobs,
-  deleteOldJobs,
+  deleteJob,
 };
