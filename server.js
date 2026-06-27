@@ -350,6 +350,87 @@ async function analyzeTranscript({ segments, context }) {
 }
 
 // ---------------------------------------------------------------------------
+// Claude automatic summary
+// ---------------------------------------------------------------------------
+
+// JSON schema constraining the structured Norwegian legal summary. Every key is
+// required; arrays may be empty when a section has nothing to report.
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    hvem: { type: 'array', items: { type: 'string' } },
+    hovedpunkter: { type: 'array', items: { type: 'string' } },
+    motsigelser: { type: 'array', items: { type: 'string' } },
+    datoerOgTall: { type: 'array', items: { type: 'string' } },
+    anbefalteSporsmal: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['hvem', 'hovedpunkter', 'motsigelser', 'datoerOgTall', 'anbefalteSporsmal'],
+  additionalProperties: false,
+};
+
+/**
+ * Generate a structured Norwegian legal summary of the transcript. Unlike the
+ * opt-in analysis, this always runs — it only uses the transcript text that
+ * already lives on our EU servers. Returns the parsed summary object, or null
+ * when summarisation is unavailable (no API key, no transcript text). Throws on
+ * an actual API/parse failure so the caller can swallow it.
+ */
+async function generateSummary({ text, context }) {
+  if (!anthropic) {
+    console.warn('[summary] ANTHROPIC_API_KEY not configured; skipping summary.');
+    return null;
+  }
+  if (!text || !text.trim()) {
+    return null;
+  }
+
+  const contextBlock =
+    context && context.trim()
+      ? `\n\nKontekst oppgitt av brukeren (navn, steder, fagtermer som kan forekomme):\n${context.trim()}\n`
+      : '';
+
+  const system =
+    'Du er en juridisk assistent for et norsk advokatfirma. Du lager et kort, ' +
+    'strukturert sammendrag av en transkripsjon av et lydopptak. Du svarer alltid ' +
+    'på norsk og baserer deg kun på innholdet i transkripsjonen. Du fyller ut feltene:\n' +
+    '- "hvem": personer/parter som er til stede eller nevnes i opptaket.\n' +
+    '- "hovedpunkter": 3-5 punkter med de viktigste utsagnene.\n' +
+    '- "motsigelser": motsigelser eller uklarheter i opptaket (tom liste hvis ingen).\n' +
+    '- "datoerOgTall": viktige datoer, beløp, saksnumre og tall som nevnes (tom liste hvis ingen).\n' +
+    '- "anbefalteSporsmal": 2-3 anbefalte oppfølgingsspørsmål advokaten kan stille.\n' +
+    'Hvert felt er en liste med korte strenger. Ikke dikt opp informasjon som ikke ' +
+    'finnes i transkripsjonen.';
+
+  const userText =
+    'Lag et sammendrag av følgende transkripsjon.' +
+    contextBlock +
+    '\n\nTranskripsjon:\n' +
+    text.trim();
+
+  // Stream the response so a long transcript doesn't risk an HTTP timeout.
+  const stream = anthropic.messages.stream({
+    model: CLAUDE_MODEL,
+    max_tokens: 8000,
+    system,
+    output_config: { format: { type: 'json_schema', schema: SUMMARY_SCHEMA } },
+    messages: [{ role: 'user', content: userText }],
+  });
+
+  const message = await stream.finalMessage();
+
+  if (message.stop_reason === 'refusal') {
+    throw new Error('Claude refused to summarize the transcript.');
+  }
+
+  const textBlock = message.content.find((block) => block.type === 'text');
+  if (!textBlock) {
+    throw new Error('Claude summary response contained no text block.');
+  }
+
+  return JSON.parse(textBlock.text);
+}
+
+// ---------------------------------------------------------------------------
 // Background transcription runner
 // ---------------------------------------------------------------------------
 
@@ -411,6 +492,24 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
     },
   };
 
+  // Always generate an automatic Norwegian legal summary. Unlike the opt-in
+  // analysis, this has no GDPR implication beyond what the transcript already
+  // does — it only reuses the transcript text already on our EU servers. Kick
+  // it off now so it runs concurrently with any analysis below; it's awaited
+  // before the job is marked done. Failures are non-fatal: the transcript is
+  // still delivered with the summary error recorded on the job.
+  currentJob.summary = null;
+  currentJob.summary_error = null;
+  console.log(`[summary:${jobId}] Generating summary with ${CLAUDE_MODEL}`);
+  const summaryPromise = generateSummary({ text: currentJob.result.text, context })
+    .then((summary) => {
+      currentJob.summary = summary;
+    })
+    .catch((err) => {
+      console.error(`[summary:${jobId}] Summary failed:`, err.message);
+      currentJob.summary_error = err.message || 'Claude summary failed.';
+    });
+
   // Post-process the transcript with Claude only when the client opted in.
   // Analysis sends the transcript to the Anthropic API (outside the EU), so
   // when it runs we surface a GDPR notice on the result. Failures here are
@@ -430,6 +529,11 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
       currentJob.analysis_error = err.message || 'Claude analysis failed.';
     }
   }
+
+  // Wait for the summary to settle before marking the job done so the result
+  // and summary arrive together. summaryPromise never rejects (it records its
+  // own error), so this can't throw.
+  await summaryPromise;
 
   currentJob.status = 'done';
 
@@ -466,6 +570,7 @@ app.post('/transcribe', (req, res) => {
     jobs.set(jobId, {
       status: 'processing',
       result: null,
+      summary: null,
       analysis: null,
       error: null,
       created_at: Date.now(),
@@ -497,6 +602,8 @@ app.get('/status/:job_id', (req, res) => {
     return res.json({
       status: 'done',
       result: job.result,
+      summary: job.summary,
+      summary_error: job.summary_error || null,
       analysis: job.analysis,
       analysis_error: job.analysis_error || null,
     });
