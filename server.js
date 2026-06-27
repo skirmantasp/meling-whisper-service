@@ -16,6 +16,9 @@ const PORT = process.env.PORT || 3000;
 const WHISPER_MODEL = process.env.WHISPER_MODEL || 'NbAiLab/nb-whisper-large-v3';
 const CLAUDE_MODEL = process.env.CLAUDE_MODEL || 'claude-sonnet-4-6';
 const DEFAULT_LANGUAGE = 'no';
+// Base URL of the portal frontend, used to build deep links in notification
+// emails. Overridable via env for local/staging deployments.
+const PORTAL_URL = process.env.PORTAL_URL || 'https://meling-portal-production.up.railway.app';
 
 // Anthropic client — reads ANTHROPIC_API_KEY from the environment. The SDK
 // constructor throws when no key is present, so only construct it when the key
@@ -175,10 +178,19 @@ function notifyJobSuccess(email, jobId, result, processingMs) {
   if (!email) return;
 
   const preview = (result.text || '').slice(0, 300);
+  const filename = result.metadata && result.metadata.original_filename;
+  const link = `${PORTAL_URL}/transcription?jobId=${encodeURIComponent(jobId)}`;
+  const button =
+    `<a href="${escapeHtml(link)}" ` +
+    `style="display:inline-block;padding:12px 24px;background:#1a2b4a;color:#ffffff;` +
+    `text-decoration:none;border-radius:8px;font-weight:600;font-size:15px;">` +
+    `Åpne transkripsjonen →</a>`;
+
   const html =
     `<h2>Transkripsjon ferdig ✓</h2>` +
-    `<p><strong>Jobb-ID:</strong> ${escapeHtml(jobId)}</p>` +
+    (filename ? `<p><strong>Fil:</strong> ${escapeHtml(filename)}</p>` : '') +
     `<p><strong>Behandlingstid:</strong> ${escapeHtml(formatProcessingTime(processingMs))}</p>` +
+    `<p style="margin:24px 0;">${button}</p>` +
     `<p><strong>Forhåndsvisning:</strong></p>` +
     `<blockquote>${escapeHtml(preview)}${result.text.length > 300 ? '…' : ''}</blockquote>`;
 
