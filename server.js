@@ -30,7 +30,9 @@ const GDPR_NOTE =
   'using the open-source NB-Whisper Norwegian model. No audio or transcript leaves the EU, ' +
   'and all temporary files are deleted immediately after processing.';
 
-const UPLOAD_DIR = '/tmp/whisper-uploads/';
+// Uploaded audio lives on the Railway persistent volume (mounted at /data/audio)
+// so retained recordings survive redeploys/restarts. Overridable via env.
+const UPLOAD_DIR = process.env.UPLOAD_DIR || '/data/audio/';
 const OUTPUT_DIR = '/tmp/whisper-output/';
 
 // Ensure working directories exist.
