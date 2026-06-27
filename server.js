@@ -8,6 +8,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { Anthropic } = require('@anthropic-ai/sdk');
+const db = require('./db');
 
 const app = express();
 
@@ -45,12 +46,10 @@ const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB — large legal recordings (s
 const UPLOAD_TIMEOUT_MS = 60 * 60 * 1000;            // 60 min — HTTP upload socket/request
 const TRANSCRIPTION_TIMEOUT_MS = 4 * 60 * 60 * 1000; // 4 h   — Whisper inference call
 
-// In-memory registry of async transcription jobs. Each entry:
-//   { status: 'processing' | 'done' | 'error', result, error, created_at }
-const jobs = new Map();
-// Keep jobs alive long enough to cover a multi-hour transcription plus the
-// client's polling/result retrieval afterwards.
-const JOB_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+// Transcription jobs are persisted in PostgreSQL (see db.js) so they survive
+// server restarts/redeploys. Rows older than 6 hours are purged by a periodic
+// sweep (see CLEANUP_INTERVAL_MS below).
+const CLEANUP_INTERVAL_MS = 30 * 60 * 1000; // run TTL cleanup every 30 minutes
 
 app.use(cors({
   origin: [
@@ -446,12 +445,17 @@ async function generateSummary({ text, context }) {
 
 /**
  * Submit a transcription job to the persistent Python Whisper server, then
- * update the job entry in `jobs` when it completes or fails. Never throws;
- * all outcomes are recorded on the job.
+ * persist the outcome to the jobs table when it completes or fails. Never
+ * throws; all outcomes are recorded on the job row.
  */
 async function runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze }) {
-  const job = jobs.get(jobId);
-  if (!job) return;
+  // Read created_at once (set when the row was inserted) so processing time can
+  // be reported even after a long transcription. Fall back to now if the row or
+  // DB is unavailable.
+  const existing = await db.getJob(jobId).catch(() => null);
+  const createdAtMs = existing && existing.created_at
+    ? new Date(existing.created_at).getTime()
+    : Date.now();
 
   console.log(`[transcribe:${jobId}] Sending to whisper server: ${inputPath}`);
 
@@ -460,21 +464,21 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
     whisperResult = await callWhisperServer(inputPath, language, context);
   } catch (err) {
     safeUnlink(inputPath);
-    const currentJob = jobs.get(jobId);
-    if (!currentJob) return;
-    const processingMs = Date.now() - currentJob.created_at;
+    const processingMs = Date.now() - createdAtMs;
     console.error(`[transcribe:${jobId}] Whisper failed:`, err.message);
-    currentJob.status = 'error';
-    currentJob.error = err.message || 'Transcription failed.';
-    notifyJobError(email, jobId, currentJob.error, processingMs);
+    const errorMsg = err.message || 'Transcription failed.';
+    try {
+      await db.updateJob(jobId, { status: 'error', error: errorMsg });
+    } catch (dbErr) {
+      console.error(`[transcribe:${jobId}] Failed to persist error:`, dbErr.message);
+    }
+    notifyJobError(email, jobId, errorMsg, processingMs);
     return;
   }
 
   safeUnlink(inputPath);
 
-  const currentJob = jobs.get(jobId);
-  if (!currentJob) return;
-  const processingMs = Date.now() - currentJob.created_at;
+  const processingMs = Date.now() - createdAtMs;
 
   const rawSegments = Array.isArray(whisperResult.segments) ? whisperResult.segments : [];
   const segments = rawSegments.map((seg, index) => ({
@@ -489,7 +493,7 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
   const durationSeconds =
     segments.length > 0 ? segments[segments.length - 1].end_seconds : 0;
 
-  currentJob.result = {
+  const result = {
     text: (whisperResult.text || '').trim(),
     language: whisperResult.language || language,
     duration_seconds: durationSeconds,
@@ -508,16 +512,16 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
   // it off now so it runs concurrently with any analysis below; it's awaited
   // before the job is marked done. Failures are non-fatal: the transcript is
   // still delivered with the summary error recorded on the job.
-  currentJob.summary = null;
-  currentJob.summary_error = null;
+  let summary = null;
+  let summaryError = null;
   console.log(`[summary:${jobId}] Generating summary with ${CLAUDE_MODEL}`);
-  const summaryPromise = generateSummary({ text: currentJob.result.text, context })
-    .then((summary) => {
-      currentJob.summary = summary;
+  const summaryPromise = generateSummary({ text: result.text, context })
+    .then((s) => {
+      summary = s;
     })
     .catch((err) => {
       console.error(`[summary:${jobId}] Summary failed:`, err.message);
-      currentJob.summary_error = err.message || 'Claude summary failed.';
+      summaryError = err.message || 'Claude summary failed.';
     });
 
   // Post-process the transcript with Claude only when the client opted in.
@@ -525,36 +529,47 @@ async function runWhisperJob({ jobId, inputPath, originalFilename, language, mod
   // when it runs we surface a GDPR notice on the result. Failures here are
   // non-fatal — the transcript is still delivered, with the analysis error
   // recorded on the job.
-  currentJob.analysis = null;
-  currentJob.analysis_error = null;
+  let analysis = null;
+  let analysisError = null;
   if (analyze) {
-    currentJob.result.analysis_gdpr_notice =
+    result.analysis_gdpr_notice =
       'Legal analysis processed via Anthropic API (outside EU). ' +
       'Enable only if you accept this.';
     try {
       console.log(`[claude:${jobId}] Analyzing ${segments.length} segments with ${CLAUDE_MODEL}`);
-      currentJob.analysis = await analyzeTranscript({ segments, context });
+      analysis = await analyzeTranscript({ segments, context });
     } catch (err) {
       console.error(`[claude:${jobId}] Analysis failed:`, err.message);
-      currentJob.analysis_error = err.message || 'Claude analysis failed.';
+      analysisError = err.message || 'Claude analysis failed.';
     }
   }
 
   // Wait for the summary to settle before marking the job done so the result
-  // and summary arrive together. summaryPromise never rejects (it records its
+  // and summary land together. summaryPromise never rejects (it records its
   // own error), so this can't throw.
   await summaryPromise;
 
-  currentJob.status = 'done';
+  try {
+    await db.updateJob(jobId, {
+      status: 'done',
+      transcript: JSON.stringify(result),
+      summary: summary === null ? null : JSON.stringify(summary),
+      summary_error: summaryError,
+      analysis: analysis === null ? null : JSON.stringify(analysis),
+      analysis_error: analysisError,
+    });
+  } catch (dbErr) {
+    console.error(`[transcribe:${jobId}] Failed to persist result:`, dbErr.message);
+  }
 
-  notifyJobSuccess(email, jobId, currentJob.result, processingMs);
+  notifyJobSuccess(email, jobId, result, processingMs);
 }
 
 // ---------------------------------------------------------------------------
 // POST /transcribe  — accepts an upload, starts a background job, returns its ID
 // ---------------------------------------------------------------------------
 app.post('/transcribe', (req, res) => {
-  upload.single('audio')(req, res, (uploadErr) => {
+  upload.single('audio')(req, res, async (uploadErr) => {
     if (uploadErr) {
       const code = uploadErr.code === 'LIMIT_FILE_SIZE' ? 413 : 400;
       return res.status(code).json({ error: uploadErr.message });
@@ -577,18 +592,16 @@ app.post('/transcribe', (req, res) => {
       Boolean(req.body && req.body.analyze === 'true');
 
     const jobId = crypto.randomUUID();
-    jobs.set(jobId, {
-      status: 'processing',
-      result: null,
-      summary: null,
-      analysis: null,
-      error: null,
-      created_at: Date.now(),
-      email,
-    });
 
-    // Drop the job entry after one hour so the Map does not grow unbounded.
-    setTimeout(() => jobs.delete(jobId), JOB_TTL_MS);
+    // Persist the job before kicking off work so it survives a restart and so
+    // /status can find it immediately.
+    try {
+      await db.createJob({ id: jobId, status: 'processing', filename: originalFilename });
+    } catch (dbErr) {
+      safeUnlink(inputPath);
+      console.error(`[transcribe:${jobId}] Failed to create job:`, dbErr.message);
+      return res.status(500).json({ error: 'Could not create transcription job.' });
+    }
 
     // Kick off Whisper in the background — do NOT await it.
     runWhisperJob({ jobId, inputPath, originalFilename, language, model, email, context, analyze })
@@ -601,8 +614,14 @@ app.post('/transcribe', (req, res) => {
 // ---------------------------------------------------------------------------
 // GET /status/:job_id  — poll the status/result of a transcription job
 // ---------------------------------------------------------------------------
-app.get('/status/:job_id', (req, res) => {
-  const job = jobs.get(req.params.job_id);
+app.get('/status/:job_id', async (req, res) => {
+  let job;
+  try {
+    job = await db.getJob(req.params.job_id);
+  } catch (dbErr) {
+    console.error(`[status:${req.params.job_id}] DB lookup failed:`, dbErr.message);
+    return res.status(500).json({ status: 'error', error: 'Could not look up job status.' });
+  }
 
   if (!job) {
     return res.status(404).json({ status: 'error', error: 'Unknown or expired job ID.' });
@@ -735,6 +754,28 @@ app.use((err, req, res, next) => {
   console.error('[error]', err.message);
   res.status(500).json({ error: err.message });
 });
+
+// Initialise the database (create the jobs table) and start the periodic TTL
+// sweep. A DB failure here is logged but never crashes the server — the rest of
+// the service stays up and individual DB operations fail gracefully.
+db.initDb()
+  .then(() => {
+    console.log('✅ Database ready (jobs table ensured).');
+  })
+  .catch((err) => {
+    console.error('[db] Initialisation failed (server will continue):', err.message);
+  });
+
+// Purge jobs older than 6 hours every 30 minutes. Self-contained try/catch so a
+// transient DB error doesn't take down the interval.
+setInterval(async () => {
+  try {
+    const removed = await db.deleteOldJobs();
+    if (removed > 0) console.log(`[db] Cleaned up ${removed} job(s) older than 6 hours.`);
+  } catch (err) {
+    console.error('[db] TTL cleanup failed:', err.message);
+  }
+}, CLEANUP_INTERVAL_MS);
 
 const server = app.listen(PORT, () => {
   console.log(`✅ Meling Whisper Service running on port ${PORT}`);
